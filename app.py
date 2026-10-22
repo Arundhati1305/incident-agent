@@ -595,8 +595,6 @@ def dispatch(st, a, t, approval=None):
     d = {"actionId": a["actionId"], "callId": a["callId"], "phase": a["phase"], "toolName": a["toolName"],
          "arguments": a["arguments"], "evidence": a["evidence"], "attempt": attempt,
          "traceparent": f"00-{I['traceId']}-{sid}-01"}
-    if I["tracestate"]:
-        d["tracestate"] = I["tracestate"]
     if approval:
         d["approvalId"], d["approvalNonce"] = approval["approvalId"], approval["nonce"]
     a["attempts"].append({"attempt": attempt, "clientSpanId": sid, "dispatchedAt": t})
@@ -843,23 +841,20 @@ def build_otlp(st):
 
 
 def build_response(st):
-    if st["status"] == "waiting":
-        # pending responses use exactly the documented waiting shape
-        resp = {"runId": st["runId"], "status": "waiting", "diagnosis": st["diagnosis"],
-                "dispatches": st["out"]["dispatches"], "approvals": st["out"]["approvals"]}
-    else:
-        resp = {
-            "runId": st["runId"],
-            "status": st["status"],
-            "diagnosis": st["diagnosis"],
-            "chosenEffect": st["chosenEffect"],
-            "suppressed": st["suppressed"],
-            "dispatches": [],
-            "approvals": [],
-            "actionLog": st["actionLog"],
-            "receiptLog": st["receiptLog"],
-            "otlp": build_otlp(st),
-        }
+    waiting = st["status"] == "waiting"
+    resp = {
+        "runId": st["runId"],
+        "status": st["status"],
+        "diagnosis": st["diagnosis"],
+        "dispatches": st["out"]["dispatches"] if waiting else [],
+        "approvals": st["out"]["approvals"] if waiting else [],
+        "suppressed": st["suppressed"],
+        "actionLog": st["actionLog"],
+        "receiptLog": st["receiptLog"],
+        "otlp": build_otlp(st),
+    }
+    if st["chosenEffect"]:
+        resp["chosenEffect"] = st["chosenEffect"]
     return scrub(drop_nulls(resp), st["i"]["secrets"])
 
 
@@ -931,7 +926,10 @@ async def create_incident(request: Request):
         t_m1 = now_ns()
         plan = normalize_plan(raw, body, secrets_)
         if ADMIN_TOKEN:
-            db_debug(run_id, {k: v for k, v in body.items() if k != "sensitive"}, raw, plan)
+            dbg_req = {k: v for k, v in body.items() if k != "sensitive"}
+            dbg_req["_headers"] = {k: v for k, v in request.headers.items()
+                                   if k.lower() not in ("authorization", "cookie")}
+            db_debug(run_id, dbg_req, raw, plan)
         st = init_state(body, plan, meta, tp_in, ts_in, t_req, t_m0, t_m1, secrets_)
         resp = build_response(st)
         db_insert_run(run_id, body_hash, json.dumps(st), json.dumps(resp))  # store before responding
