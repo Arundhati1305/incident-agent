@@ -304,7 +304,14 @@ DIAGNOSTICS (read-only tools, run in parallel, minimum needed, never more than m
 - log signatures (timeouts, errors, recursive traces, auth failures) -> query_logs {service, query, windowMinutes}
 - a named upstream dependency -> dependency_status {dependency: "<exact dependency id>"}
 - evidence says a runbook must be consulted before acting -> read_runbook {service, topic}
-If the evidence contains BOTH an independent metric measurement and an independent log signature for the same cause (e.g. pool wait metric AND pool-timeout logs), call both query_metrics and query_logs. Otherwise prefer exactly one call. Use windowMinutes 60, short snake_case metric names, short plain queries, and the exact service/dependency ids from the evidence.
+Exactly ONE diagnostic for these root causes:
+- deployment_regression -> inspect_deployment only
+- dependency_certificate_expired -> dependency_status only
+- feature_flag_recursion -> query_logs only
+- traffic_capacity_exhaustion -> query_metrics only
+- secret_rotation_mismatch -> read_runbook only when the evidence says a runbook must be consulted first, otherwise query_logs only
+TWO parallel diagnostics only for database_connection_exhaustion when the evidence has both a pool-wait/connection metric and pool-timeout log lines -> query_metrics and query_logs.
+Never add a second call just because another tool could also show the symptom. Use windowMinutes 60, short snake_case metric names, short plain queries, and the exact service/dependency ids from the evidence.
 
 EFFECT: exactly one tool from effectTools, with exact identifiers from the evidence:
 - deployment_regression -> rollback_deployment {service, release: "<the previously healthy release id named in the evidence>"}
@@ -836,19 +843,23 @@ def build_otlp(st):
 
 
 def build_response(st):
-    resp = {
-        "runId": st["runId"],
-        "status": st["status"],
-        "diagnosis": st["diagnosis"],
-        "suppressed": st["suppressed"],
-        "dispatches": st["out"]["dispatches"] if st["status"] == "waiting" else [],
-        "approvals": st["out"]["approvals"] if st["status"] == "waiting" else [],
-        "actionLog": st["actionLog"],
-        "receiptLog": st["receiptLog"],
-        "otlp": build_otlp(st),
-    }
-    if st["chosenEffect"]:
-        resp["chosenEffect"] = st["chosenEffect"]
+    if st["status"] == "waiting":
+        # pending responses use exactly the documented waiting shape
+        resp = {"runId": st["runId"], "status": "waiting", "diagnosis": st["diagnosis"],
+                "dispatches": st["out"]["dispatches"], "approvals": st["out"]["approvals"]}
+    else:
+        resp = {
+            "runId": st["runId"],
+            "status": st["status"],
+            "diagnosis": st["diagnosis"],
+            "chosenEffect": st["chosenEffect"],
+            "suppressed": st["suppressed"],
+            "dispatches": [],
+            "approvals": [],
+            "actionLog": st["actionLog"],
+            "receiptLog": st["receiptLog"],
+            "otlp": build_otlp(st),
+        }
     return scrub(drop_nulls(resp), st["i"]["secrets"])
 
 
