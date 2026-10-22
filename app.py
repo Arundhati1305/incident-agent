@@ -406,10 +406,25 @@ def match_choice(v, options):
     return m[0] if m else None
 
 
-def norm_ids(v):
+def norm_ids(v, known=None):
+    """Normalise model-cited IDs; repair small copying errors (e.g. extra/missing characters)
+    by mapping to the unique known ID that shares a long prefix."""
     if not isinstance(v, list):
         return []
-    return dedupe(x.strip().strip("[]").strip() for x in v if isinstance(x, str) and x.strip())
+    out = []
+    for x in v:
+        if not isinstance(x, str) or not x.strip():
+            continue
+        x = x.strip().strip("[]").strip()
+        if known and x not in known:
+            cands = [k for k in known if len(k) >= 8 and (x.startswith(k) or k.startswith(x[: max(8, len(k) - 2)]))]
+            if not cands:
+                close = difflib.get_close_matches(x, list(known), n=1, cutoff=0.85)
+                cands = close
+            if len(cands) == 1:
+                x = cands[0]
+        out.append(x)
+    return dedupe(out)
 
 
 def coerce(v, sch):
@@ -482,11 +497,11 @@ def normalize_plan(raw, body, secrets_):
 
     root = match_choice(raw.get("rootCause"), inc["allowedRootCauses"]) or inc["allowedRootCauses"][0]
 
-    ev = [e for e in norm_ids(raw.get("evidence")) if e in ev_set]
+    ev = [e for e in norm_ids(raw.get("evidence"), ev_set) if e in ev_set]
     if len(ev) < 2:
         for d in (raw.get("diagnostics") or []) + [raw.get("effect") or {}]:
             if isinstance(d, dict):
-                ev += [e for e in norm_ids(d.get("evidence")) if e in ev_set and e not in ev]
+                ev += [e for e in norm_ids(d.get("evidence"), ev_set) if e in ev_set and e not in ev]
     ev = dedupe(ev)[:4]
     if len(ev) < 2 and not ev_all:  # cannot verify IDs: trust the model's own
         ev = norm_ids(raw.get("evidence"))[:4]
@@ -502,7 +517,7 @@ def normalize_plan(raw, body, secrets_):
         if not name:
             return None
         args = sanitize_args(d.get("arguments"), cat.get(name, {}).get("inputSchema"), inc, secrets_)
-        dev = [e for e in norm_ids(d.get("evidence")) if e in ev] or [ev[0]]
+        dev = [e for e in norm_ids(d.get("evidence"), set(ev)) if e in ev] or [ev[0]]
         return {"toolName": name, "arguments": args, "evidence": dev}
 
     diags, seen = [], set()
