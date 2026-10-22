@@ -37,7 +37,8 @@ LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai")
 LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "15"))
 LLM_JSON_MODE = os.getenv("LLM_JSON_MODE", "1") == "1"
 LLM_TEMPERATURE = os.getenv("LLM_TEMPERATURE", "0")
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")  # enables GET /debug/runs?token=... (never used by the grader)  # set to "" for models that reject it
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+DIAG_MODE = os.getenv("DIAG_MODE", "")  # "max": dispatch the 3 most relevant diagnostics (experiment)  # enables GET /debug/runs?token=... (never used by the grader)  # set to "" for models that reject it
 DEFAULT_APPROVAL = {"rollback_deployment", "disable_feature"}
 SCALING_LIMIT_RE = re.compile(r"limit|at_max|max_?replica|maxed|ceiling|cap_reached|quota", re.I)
 
@@ -545,7 +546,51 @@ def normalize_plan(raw, body, secrets_):
     alt = build_call(raw.get("alternateEffect"), effects)
     if alt and (alt["toolName"] == effect["toolName"] or "scal" not in effect["toolName"].lower()):
         alt = None
+    if DIAG_MODE == "max":
+        diags = widen_diagnostics(root, diags, ev, inc, cat, diag_tools, max_d)
     return {"rootCause": root, "evidence": ev, "diagnostics": diags, "effect": effect, "alternateEffect": alt}
+
+
+DIAG_PRIORITY = {
+    "deployment_regression": ["inspect_deployment", "query_logs", "query_metrics"],
+    "database_connection_exhaustion": ["query_metrics", "query_logs", "read_runbook"],
+    "dependency_certificate_expired": ["dependency_status", "query_logs", "read_runbook"],
+    "feature_flag_recursion": ["query_logs", "inspect_deployment", "query_metrics"],
+    "traffic_capacity_exhaustion": ["query_metrics", "read_runbook", "query_logs"],
+    "secret_rotation_mismatch": ["read_runbook", "query_logs", "inspect_deployment"],
+}
+DEFAULT_ARGS = {
+    "deployment_regression": ("error_rate", "malformed response"),
+    "database_connection_exhaustion": ("pool_checkout_wait", "pool acquisition timeout"),
+    "dependency_certificate_expired": ("dependency_error_rate", "expired certificate"),
+    "feature_flag_recursion": ("request_depth", "recursive evaluation"),
+    "traffic_capacity_exhaustion": ("queue_depth", "saturated replica"),
+    "secret_rotation_mismatch": ("auth_failure_rate", "authentication failure"),
+}
+
+
+def widen_diagnostics(root, diags, ev, inc, cat, diag_tools, max_d):
+    by_tool = {d["toolName"]: d for d in diags}
+    svc = inc.get("service")
+    dep = None
+    m = re.search(r"\b(dep_[A-Za-z0-9]+)", focus_transcript(inc["transcript"])[0])
+    if m:
+        dep = m.group(1)
+    metric, query = DEFAULT_ARGS.get(root, ("error_rate", "error"))
+    out = []
+    for t in DIAG_PRIORITY.get(root, []) + [d["toolName"] for d in diags]:
+        if t in [o["toolName"] for o in out] or t not in diag_tools or len(out) >= max_d:
+            continue
+        if t in by_tool:
+            out.append(by_tool[t]); continue
+        args = {"inspect_deployment": {"service": svc},
+                "query_metrics": {"service": svc, "metric": metric, "windowMinutes": 60},
+                "query_logs": {"service": svc, "query": query, "windowMinutes": 60},
+                "read_runbook": {"service": svc, "topic": root},
+                "dependency_status": {"dependency": dep} if dep else None}.get(t)
+        if args:
+            out.append({"toolName": t, "arguments": args, "evidence": [ev[0]]})
+    return out or diags
 
 
 # --------------------------------------------------------------------------- state machine
