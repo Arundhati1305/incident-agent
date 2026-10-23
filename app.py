@@ -38,6 +38,7 @@ LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "15"))
 LLM_JSON_MODE = os.getenv("LLM_JSON_MODE", "1") == "1"
 LLM_TEMPERATURE = os.getenv("LLM_TEMPERATURE", "0")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+EVIDENCE_MODE = os.getenv("EVIDENCE_MODE", "")  # "first2": cite the first two kept evidence lines (experiment)
 DIAG_MODE = os.getenv("DIAG_MODE", "")  # "max": dispatch the 3 most relevant diagnostics (experiment)  # enables GET /debug/runs?token=... (never used by the grader)  # set to "" for models that reject it
 DEFAULT_APPROVAL = {"rollback_deployment", "disable_feature"}
 SCALING_LIMIT_RE = re.compile(r"limit|at_max|max_?replica|maxed|ceiling|cap_reached|quota", re.I)
@@ -546,6 +547,13 @@ def normalize_plan(raw, body, secrets_):
     alt = build_call(raw.get("alternateEffect"), effects)
     if alt and (alt["toolName"] == effect["toolName"] or "scal" not in effect["toolName"].lower()):
         alt = None
+    if EVIDENCE_MODE == "first2":
+        kept = EV_LINE.findall(focus_transcript(inc["transcript"])[0])
+        if len(kept) >= 2:
+            ev = kept[:2]
+            for d in diags:
+                d["evidence"] = [e for e in d["evidence"] if e in ev] or [ev[0]]
+            effect["evidence"] = [e for e in effect["evidence"] if e in ev] or [ev[0]]
     if DIAG_MODE == "max":
         diags = widen_diagnostics(root, diags, ev, inc, cat, diag_tools, max_d)
     return {"rootCause": root, "evidence": ev, "diagnostics": diags, "effect": effect, "alternateEffect": alt}
