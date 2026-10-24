@@ -40,6 +40,7 @@ LLM_TEMPERATURE = os.getenv("LLM_TEMPERATURE", "0")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 EVIDENCE_MODE = os.getenv("EVIDENCE_MODE", "")  # "first2": cite the first two kept evidence lines (experiment)
 DIAG_MODE = os.getenv("DIAG_MODE", "")  # "max": dispatch the 3 most relevant diagnostics (experiment)  # enables GET /debug/runs?token=... (never used by the grader)  # set to "" for models that reject it
+REPLAY_MODE = os.getenv("REPLAY_MODE", "current")  # "current": replay returns stored current state; "original": replay returns the response first sent for that request/receipt
 DEFAULT_APPROVAL = {"rollback_deployment", "disable_feature"}
 SCALING_LIMIT_RE = re.compile(r"limit|at_max|max_?replica|maxed|ceiling|cap_reached|quota", re.I)
 
@@ -663,6 +664,8 @@ def dispatch(st, a, t, approval=None):
     d = {"actionId": a["actionId"], "callId": a["callId"], "phase": a["phase"], "toolName": a["toolName"],
          "arguments": a["arguments"], "evidence": a["evidence"], "attempt": attempt,
          "traceparent": f"00-{I['traceId']}-{sid}-01"}
+    if I.get("tracestate"):
+        d["tracestate"] = I["tracestate"]  # propagate incoming W3C tracestate on every outgoing call
     if approval:
         d["approvalId"], d["approvalNonce"] = approval["approvalId"], approval["nonce"]
     a["attempts"].append({"attempt": attempt, "clientSpanId": sid, "dispatchedAt": t})
@@ -921,9 +924,12 @@ def build_response(st):
         "receiptLog": st["receiptLog"],
         "otlp": build_otlp(st),
     }
-    if st["chosenEffect"]:
-        resp["chosenEffect"] = st["chosenEffect"]
-    return scrub(drop_nulls(resp), st["i"]["secrets"])
+    out = drop_nulls(resp)
+    if not waiting:
+        out["chosenEffect"] = st["chosenEffect"] or None  # always present in a final result (null if none)
+    elif st["chosenEffect"]:
+        out["chosenEffect"] = st["chosenEffect"]
+    return scrub(out, st["i"]["secrets"])
 
 
 def drop_nulls(o):
@@ -985,7 +991,8 @@ async def create_incident(request: Request):
         row = db_get_run(run_id)
         if row:
             if row[0] == body_hash:
-                return jresp(json.loads(row[3]))  # replay: current stored state, no model, no action
+                # replay: stored state only, no model, no action
+                return jresp(json.loads(row[2] if REPLAY_MODE == "original" else row[3]))
             return err(409, "runId already exists with different content")
         t_req = now_ns()
         secrets_ = collect_secrets(body)
@@ -1022,7 +1029,8 @@ async def post_receipt(run_id: str, request: Request):
         prev = db_get_receipt(run_id, rid)
         if prev:
             if prev[0] == body_hash:
-                return jresp(json.loads(row[3]))  # identical replay: current stored state
+                # identical replay: stored state only
+                return jresp(json.loads(prev[1] if REPLAY_MODE == "original" else row[3]))
             return err(409, "receiptId already used with different content")
         st = json.loads(row[1])
         log.info("receipt %s: outcomes=%s approvals=%s", rid,
