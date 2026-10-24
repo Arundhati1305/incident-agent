@@ -40,6 +40,7 @@ LLM_TEMPERATURE = os.getenv("LLM_TEMPERATURE", "0")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 EVIDENCE_MODE = os.getenv("EVIDENCE_MODE", "")  # "first2": cite the first two kept evidence lines (experiment)
 DIAG_MODE = os.getenv("DIAG_MODE", "")  # "max": dispatch the 3 most relevant diagnostics (experiment)  # enables GET /debug/runs?token=... (never used by the grader)  # set to "" for models that reject it
+WAITING_SHAPE = os.getenv("WAITING_SHAPE", "minimal")  # "minimal": waiting responses carry only the spec's first-response keys; "full": also actionLog/receiptLog/otlp
 REPLAY_MODE = os.getenv("REPLAY_MODE", "current")  # "current": replay returns stored current state; "original": replay returns the response first sent for that request/receipt
 DEFAULT_APPROVAL = {"rollback_deployment", "disable_feature"}
 SCALING_LIMIT_RE = re.compile(r"limit|at_max|max_?replica|maxed|ceiling|cap_reached|quota", re.I)
@@ -948,10 +949,9 @@ def build_response(st):
             "diagnosis": st["diagnosis"],
             "dispatches": st["out"]["dispatches"],
             "approvals": st["out"]["approvals"],
-            "actionLog": st["actionLog"],
-            "receiptLog": st["receiptLog"],
-            "otlp": build_otlp(st),
         }
+        if WAITING_SHAPE == "full":
+            resp.update({"actionLog": st["actionLog"], "receiptLog": st["receiptLog"], "otlp": build_otlp(st)})
         return scrub(drop_nulls(resp), st["i"]["secrets"])
     resp = {
         "runId": st["runId"],
