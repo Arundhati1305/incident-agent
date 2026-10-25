@@ -4,6 +4,7 @@ Routes
   POST /v2/incidents                     -> plan (one model call), first dispatches
   POST /v2/incidents/{runId}/receipts    -> receipt-driven state machine (no model)
   GET  /v2/incidents/{runId}             -> current stored state (no model)
+  GET  /healthz                          -> cheap liveness probe (no DB, no model)
 
 Layers are kept separate:
   planner  (plan_incident / normalize_plan)   -- only place a model is called
@@ -11,6 +12,7 @@ Layers are kept separate:
   trace    (build_otlp)                       -- pure function of stored state
 """
 import asyncio
+import contextlib
 import difflib
 import hashlib
 import json
@@ -44,6 +46,15 @@ WAITING_SHAPE = os.getenv("WAITING_SHAPE", "minimal")  # "minimal": waiting resp
 REPLAY_MODE = os.getenv("REPLAY_MODE", "current")  # "current": replay returns stored current state; "original": replay returns the response first sent for that request/receipt
 DEFAULT_APPROVAL = {"rollback_deployment", "disable_feature"}
 SCALING_LIMIT_RE = re.compile(r"limit|at_max|max_?replica|maxed|ceiling|cap_reached|quota", re.I)
+
+# Keep-alive (Render free tier sleeps after ~15 min without inbound traffic).
+# Render sets RENDER_EXTERNAL_URL automatically; locally it is absent, so pinging stays off.
+_render_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+KEEPALIVE_URL = os.getenv("KEEPALIVE_URL", f"{_render_url}/healthz" if _render_url else "")
+try:
+    KEEPALIVE_INTERVAL = max(60, int(os.getenv("KEEPALIVE_INTERVAL", "600")))  # seconds; keep under 900
+except ValueError:
+    KEEPALIVE_INTERVAL = 600
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("incident-agent")  # never log bodies
@@ -977,8 +988,38 @@ def drop_nulls(o):
     return o
 
 
+# --------------------------------------------------------------------------- keep-alive (Render free tier)
+async def keepalive_loop():
+    """Ping our own public URL so Render sees inbound traffic and never idles the service."""
+    await asyncio.sleep(30)  # let the server finish booting
+    async with httpx.AsyncClient(timeout=10) as client:
+        while True:
+            try:
+                r = await client.get(KEEPALIVE_URL, headers={"User-Agent": "ga5-keepalive"})
+                if r.status_code >= 400:
+                    log.warning("keep-alive ping returned HTTP %s", r.status_code)
+            except Exception as e:  # never let a failed ping kill the loop
+                log.warning("keep-alive ping failed: %s", type(e).__name__)
+            await asyncio.sleep(KEEPALIVE_INTERVAL)
+
+
+@contextlib.asynccontextmanager
+async def lifespan(_app):
+    task = None
+    if KEEPALIVE_URL:
+        task = asyncio.create_task(keepalive_loop())
+        log.info("keep-alive enabled: every %ss", KEEPALIVE_INTERVAL)
+    try:
+        yield
+    finally:
+        if task:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+
 # --------------------------------------------------------------------------- HTTP
-app = FastAPI(redirect_slashes=False, docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(redirect_slashes=False, docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 
 
 def jresp(obj, status=200):
@@ -1010,6 +1051,12 @@ async def _any_error(_request, exc: Exception):
 
 @app.get("/")
 async def root():
+    return jresp({"ok": True, "profile": PROFILE})
+
+
+@app.api_route("/healthz", methods=["GET", "HEAD"])
+async def healthz():
+    # cheap liveness probe: no DB, no model call
     return jresp({"ok": True, "profile": PROFILE})
 
 
